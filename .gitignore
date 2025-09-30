@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+# Environments
+.env
+.venv
+
+# VS Code
+.vscode/
+
+.DS_Store
+
+# RAG index files
+*.index
+*.json
+faiss.index
+meta.json
