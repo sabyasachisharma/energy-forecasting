@@ -1,7 +1,3 @@
-"""
-Configuration management for the energy pricing application.
-"""
-
 import os
 import logging
 from typing import Optional
@@ -11,8 +7,48 @@ from dotenv import load_dotenv
 load_dotenv()
 
 @dataclass
+class SFTPConfig:
+    """SFTP configuration for spot pricing data"""
+    host: str
+    port: int
+    username: str
+    password: str
+    
+    @classmethod
+    def from_env(cls) -> "SFTPConfig":
+        return cls(
+            host=os.getenv("SPOT_PRICING_SFTP_HOST"),
+            port=int(os.getenv("SPOT_PRICING_SFTP_PORT", "22")),
+            username=os.getenv("SPOT_PRICING_SFTP_USERNAME", ""),
+            password=os.getenv("SPOT_PRICING_SFTP_PASSWORD", "")
+        )
+
+@dataclass
+class MySQLConfig:
+    """MySQL database configuration"""
+    host: str
+    port: int
+    name: str
+    user: str
+    password: str
+    
+    @property
+    def connection_url(self) -> str:
+        return f"mysql+pymysql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
+    
+    @classmethod
+    def from_env(cls) -> "MySQLConfig":
+        return cls(
+            host=os.getenv("MYSQL_HOST", "localhost"),
+            port=int(os.getenv("MYSQL_PORT", "3306")),
+            name=os.getenv("MYSQL_DB_NAME", "aplus"),
+            user=os.getenv("MYSQL_DB_USER", "root"),
+            password=os.getenv("MYSQL_DB_PASS", "")
+        )
+
+@dataclass
 class DatabaseConfig:
-    """TimescaleDB Tiger Cloud configuration."""
+    """TimescaleDB configuration"""
     host: str
     port: int
     name: str
@@ -22,12 +58,10 @@ class DatabaseConfig:
     
     @property
     def connection_url(self) -> str:
-        """Get the database connection URL with SSL."""
         return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}?sslmode={self.ssl_mode}"
     
     @classmethod
     def from_env(cls) -> "DatabaseConfig":
-        """Create Tiger Cloud database config from environment variables."""
         return cls(
             host=os.getenv("DB_HOST", "jp4ibi3bkd.wg59k3p2y1.tsdb.cloud.timescale.com"),
             port=int(os.getenv("DB_PORT", "37813")),
@@ -39,9 +73,12 @@ class DatabaseConfig:
 
 @dataclass
 class AppConfig:
-    """Application configuration settings."""
+    """Application configuration settings"""
     database: DatabaseConfig
+    mysql: MySQLConfig
+    sftp: SFTPConfig
     use_database: bool
+    sync_from_mysql: bool
     index_dir: str
     api_host: str
     api_port: int
@@ -51,10 +88,12 @@ class AppConfig:
     
     @classmethod
     def from_env(cls) -> "AppConfig":
-        """Create app config from environment variables."""
         return cls(
             database=DatabaseConfig.from_env(),
+            mysql=MySQLConfig.from_env(),
+            sftp=SFTPConfig.from_env(),
             use_database=os.getenv("USE_DATABASE", "true").lower() == "true",
+            sync_from_mysql=os.getenv("SYNC_FROM_MYSQL", "false").lower() == "true",
             index_dir=os.getenv("INDEX_DIR", "data"),
             api_host=os.getenv("API_HOST", "127.0.0.1"),
             api_port=int(os.getenv("API_PORT", "8000")),
@@ -64,7 +103,7 @@ class AppConfig:
         )
     
     def validate(self) -> bool:
-        """Validate configuration settings."""
+        """Validate configuration settings"""
         issues = []
         
         if self.use_database:
@@ -77,7 +116,6 @@ class AppConfig:
             if not self.database.host:
                 issues.append("Database host not set")
         
-        
         if issues:
             logging.warning("Configuration issues found:")
             for issue in issues:
@@ -89,7 +127,7 @@ class AppConfig:
 _config: Optional[AppConfig] = None
 
 def get_config() -> AppConfig:
-    """Get the global application configuration."""
+    """Get the global application configuration"""
     global _config
     if _config is None:
         _config = AppConfig.from_env()
@@ -101,26 +139,38 @@ def get_config() -> AppConfig:
     return _config
 
 def reload_config() -> AppConfig:
-    """Reload configuration from environment variables."""
+    """Reload configuration from environment variables"""
     global _config
     load_dotenv(override=True)
     _config = None
     return get_config()
+
 def get_database_url() -> str:
-    """Get database connection URL."""
+    """Get database connection URL"""
     return get_config().database.connection_url
 
 def use_database() -> bool:
-    """Check if database should be used."""
+    """Check if database should be used"""
     return get_config().use_database
 
-
 def get_index_dir() -> str:
-    """Get index directory path."""
+    """Get index directory path"""
     return get_config().index_dir
 
+def get_mysql_config() -> MySQLConfig:
+    """Get MySQL database configuration"""
+    return get_config().mysql
+
+def get_sftp_config() -> SFTPConfig:
+    """Get SFTP configuration"""
+    return get_config().sftp
+
+def sync_from_mysql() -> bool:
+    """Check if MySQL sync is enabled"""
+    return get_config().sync_from_mysql
+
 def get_openai_config() -> tuple[Optional[str], str]:
-    """Get OpenAI API key and model."""
+    """Get OpenAI API key and model"""
     config = get_config()
     return config.openai_api_key, config.openai_model
 

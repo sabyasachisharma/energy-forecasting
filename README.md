@@ -12,7 +12,7 @@ cp config.env.example .env
 ```
 
 ### 2. Configure Database
-Update your `.env` file with TimescaleDB Tiger Cloud credentials:
+Update your `.env` file with TimescaleDB credentials:
 ```bash
 DB_HOST=your-host.tsdb.cloud.timescale.com
 DB_PORT=37813
@@ -37,7 +37,7 @@ streamlit run streamlit_app.py
 
 
 ### **Dual Data Sources**
-- **Primary**: TimescaleDB Tiger Cloud (time-series optimized)
+- **Primary**: TimescaleDB (time-series optimized)
 
 ## API Endpoints
 

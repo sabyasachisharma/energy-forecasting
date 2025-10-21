@@ -1,22 +1,10 @@
-"""
-SQLAlchemy models for TimescaleDB Tiger Cloud.
-"""
-
-from sqlalchemy import Column, Integer, Float, String, DateTime, text
+from sqlalchemy import Column, Integer, Float, String
 from sqlalchemy.ext.declarative import declarative_base
-from datetime import datetime
 
 Base = declarative_base()
 
-class EnergyPrice(Base):
-    """Energy price data model for TimescaleDB hypertable (time-series data)."""
-    __tablename__ = 'energy_prices'
-    
-    timestamp = Column(DateTime(timezone=True), primary_key=True)
-    price = Column(Float, nullable=False)
-
 class HistoricalEnergyPrices(Base):
-    """Historical energy prices - only essential hourly columns."""
+    """Historical energy prices - only essential hourly columns"""
     __tablename__ = 'historical_energy_prices'
     
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -49,7 +37,7 @@ class HistoricalEnergyPrices(Base):
     hour_24 = Column(Float)
     
     def to_hourly_series(self):
-        """Convert daily row to hourly time series data with DST handling."""
+        """Convert daily row to hourly time series data with DST handling"""
         from datetime import datetime, timedelta
         import pandas as pd
         
@@ -96,7 +84,7 @@ class HistoricalEnergyPrices(Base):
         return pd.DataFrame(hourly_data).set_index('timestamp') if hourly_data else pd.DataFrame()
     
     def get_peak_hours(self, threshold_percentile=75):
-        """Get peak hour indicators based on price threshold."""
+        """Get peak hour indicators based on price threshold"""
         hourly_prices = []
         
         for hour in range(1, 3):

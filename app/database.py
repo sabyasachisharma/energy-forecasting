@@ -1,21 +1,17 @@
-"""
-TimescaleDB Tiger Cloud database operations for energy pricing data.
-"""
-
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import Optional, List
+from datetime import datetime
+from typing import Optional
 import logging
-from sqlalchemy import create_engine, text, and_, or_
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from .config import get_database_url
-from .models import Base, EnergyPrice, HistoricalEnergyPrices
+from .models import Base, HistoricalEnergyPrices
 
 _engine = None
 _SessionLocal = None
 
 def get_engine():
-    """Get SQLAlchemy engine for TimescaleDB Tiger Cloud."""
+    """Get SQLAlchemy engine for TimescaleDB"""
     global _engine
     if _engine is None:
         database_url = get_database_url()
@@ -27,11 +23,11 @@ def get_engine():
             pool_recycle=1800,
             echo=False
         )
-        logging.info("Created TimescaleDB Tiger Cloud engine")
+        logging.info("Created TimescaleDB engine")
     return _engine
 
 def get_session_local():
-    """Get SQLAlchemy session local for Tiger Cloud."""
+    """Get SQLAlchemy session local for Tiger Cloud"""
     global _SessionLocal
     if _SessionLocal is None:
         engine = get_engine()
@@ -40,17 +36,12 @@ def get_session_local():
     return _SessionLocal
 
 def get_db_session() -> Session:
-    """Get database session."""
+    """Get database session"""
     SessionLocal = get_session_local()
     return SessionLocal()
 
 def init_database() -> bool:
-    """
-    Initialize TimescaleDB Tiger Cloud with hypertables and tables.
-    
-    Returns:
-        True if successful, False otherwise
-    """
+    """Initialize TimescaleDB with tables"""
     try:
         engine = get_engine()
         
@@ -58,36 +49,32 @@ def init_database() -> bool:
         
         with engine.connect() as conn:
             conn.execute(text("""
-                SELECT create_hypertable('energy_prices', 'timestamp', if_not_exists => TRUE);
-            """))
-            
-            conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_historical_energy_prices_delivery_day 
                 ON historical_energy_prices (delivery_day);
             """))
             
             conn.commit()
         
-        logging.info("TimescaleDB Tiger Cloud initialized successfully with historical_energy_prices table")
+        logging.info("TimescaleDB initialized successfully with historical_energy_prices table")
         return True
         
     except Exception as e:
-        logging.error(f"Failed to initialize TimescaleDB Tiger Cloud: {e}")
+        logging.error(f"Failed to initialize TimescaleDB: {e}")
         return False
 
 def check_db_connection() -> bool:
-    """Check if TimescaleDB Tiger Cloud connection is working."""
+    """Check if TimescaleDB connection is working"""
     try:
         engine = get_engine()
         with engine.connect() as conn:
             result = conn.execute(text("SELECT 1"))
             result.fetchone()
             
-        logging.info("TimescaleDB Tiger Cloud connection successful")
+        logging.info("TimescaleDB connection successful")
         return True
         
     except Exception as e:
-        logging.error(f"TimescaleDB Tiger Cloud connection failed: {e}")
+        logging.error(f"TimescaleDB connection failed: {e}")
         return False
 
 def load_prices_from_db(
@@ -95,290 +82,143 @@ def load_prices_from_db(
     end_time: Optional[datetime] = None,
     limit: Optional[int] = None
 ) -> pd.DataFrame:
-    """
-    Load energy prices from TimescaleDB Tiger Cloud.
-    
-    Args:
-        start_time: Start timestamp (optional)
-        end_time: End timestamp (optional) 
-        limit: Maximum number of records (optional)
-    
-    Returns:
-        DataFrame with timestamp index and price column
-    """
+    """Load energy prices from historical_energy_prices and convert to time-series format"""
     try:
-        session = get_db_session()
+        start_date = start_time.strftime('%Y-%m-%d') if start_time else None
+        end_date = end_time.strftime('%Y-%m-%d') if end_time else None
         
-        query = session.query(EnergyPrice)
+        df_historical = load_historical_prices_from_db(
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit
+        )
         
-        if start_time:
-            query = query.filter(EnergyPrice.timestamp >= start_time)
-        if end_time:
-            query = query.filter(EnergyPrice.timestamp <= end_time)
+        if df_historical.empty:
+            return pd.DataFrame()
         
-        query = query.order_by(EnergyPrice.timestamp)
+        # Convert to time-series format
+        all_hourly = []
         
-        if limit:
-            query = query.limit(limit)
+        for _, row in df_historical.iterrows():
+            base_date = pd.to_datetime(row['delivery_day'])
+            
+            for hour in range(1, 25):
+                if hour == 3:
+                    if pd.notna(row.get('hour_3a')):
+                        timestamp = base_date + pd.Timedelta(hours=2)
+                        all_hourly.append({'timestamp': timestamp, 'price': float(row['hour_3a'])})
+                    
+                    if pd.notna(row.get('hour_3b')) and row.get('hour_3b', 0) != 0:
+                        timestamp = base_date + pd.Timedelta(hours=2, minutes=30)
+                        all_hourly.append({'timestamp': timestamp, 'price': float(row['hour_3b'])})
+                else:
+                    hour_col = f'hour_{hour}'
+                    if hour_col in row and pd.notna(row[hour_col]):
+                        timestamp = base_date + pd.Timedelta(hours=hour-1)
+                        all_hourly.append({'timestamp': timestamp, 'price': float(row[hour_col])})
         
-        results = query.all()
-        session.close()
+        if not all_hourly:
+            return pd.DataFrame()
         
-        if not results:
-            logging.warning("No price data found in TimescaleDB Tiger Cloud")
-            return pd.DataFrame(columns=['price'])
-        
-        df = pd.DataFrame([
-            {'timestamp': record.timestamp, 'price': record.price}
-            for record in results
-        ])
-        
+        df = pd.DataFrame(all_hourly)
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         if df['timestamp'].dt.tz is None:
             df['timestamp'] = df['timestamp'].dt.tz_localize('Europe/Berlin')
-        else:
-            df['timestamp'] = df['timestamp'].dt.tz_convert('Europe/Berlin')
         
         df = df.sort_values('timestamp').set_index('timestamp')
-        df = df.asfreq('h', method='ffill')
-        df['price'] = df['price'].astype(float)
         
-        logging.info(f"Loaded {len(df)} price records from TimescaleDB Tiger Cloud")
+        # Apply time filters if specified - ensure timezone compatibility
+        if start_time:
+            if start_time.tzinfo is None:
+                start_time = pd.to_datetime(start_time).tz_localize('Europe/Berlin')
+            else:
+                start_time = pd.to_datetime(start_time).tz_convert('Europe/Berlin')
+            df = df[df.index >= start_time]
+            
+        if end_time:
+            if end_time.tzinfo is None:
+                end_time = pd.to_datetime(end_time).tz_localize('Europe/Berlin')
+            else:
+                end_time = pd.to_datetime(end_time).tz_convert('Europe/Berlin')
+            df = df[df.index <= end_time]
+        
+        logging.info(f"Converted {len(df_historical)} daily records to {len(df)} hourly records")
         return df
         
     except Exception as e:
-        logging.error(f"Failed to load prices from TimescaleDB Tiger Cloud: {e}")
-        return pd.DataFrame(columns=['price'])
+        logging.error(f"Failed to load prices from TimescaleDB: {e}")
+        return pd.DataFrame()
 
 def insert_prices_to_db(df: pd.DataFrame) -> bool:
-    """
-    Insert price data into TimescaleDB Tiger Cloud using upsert.
-    
-    Args:
-        df: DataFrame with timestamp index and price column
-        
-    Returns:
-        True if successful, False otherwise
-    """
+    """Insert time-series data by converting to historical format and using insert_historical_prices_to_db"""
     try:
-        session = get_db_session()
+        if df.empty:
+            logging.warning("Empty DataFrame provided for insertion")
+            return True
         
-        records = []
-        for timestamp, row in df.iterrows():
-            records.append({
-                'timestamp': timestamp,
-                'price': float(row['price'])
-            })
+        # Convert time-series data to daily historical format
+        df_daily = convert_timeseries_to_daily(df)
         
-        session.execute(text("""
-            INSERT INTO energy_prices (timestamp, price) 
-            VALUES (:timestamp, :price)
-            ON CONFLICT (timestamp) 
-            DO UPDATE SET price = EXCLUDED.price
-        """), records)
+        if df_daily.empty:
+            logging.warning("No daily data could be created from time-series")
+            return True
         
-        session.commit()
-        session.close()
-        
-        logging.info(f"Successfully inserted {len(records)} price records to TimescaleDB Tiger Cloud")
-        return True
+        # Use the historical insertion function
+        return insert_historical_prices_to_db(df_daily)
         
     except Exception as e:
-        logging.error(f"Failed to insert prices to TimescaleDB Tiger Cloud: {e}")
+        logging.error(f"Failed to insert prices into TimescaleDB: {e}")
         return False
 
-def get_price_count() -> int:
-    """Get total number of price records in TimescaleDB Tiger Cloud."""
+def convert_timeseries_to_daily(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert time-series data to daily historical format"""
     try:
-        session = get_db_session()
-        count = session.query(EnergyPrice).count()
-        session.close()
-        return count
+        if df.empty or 'price' not in df.columns:
+            return pd.DataFrame()
         
-    except Exception as e:
-        logging.error(f"Failed to get price count from TimescaleDB Tiger Cloud: {e}")
-        return 0
-
-def get_latest_timestamp() -> Optional[datetime]:
-    """Get the timestamp of the latest price record in TimescaleDB Tiger Cloud."""
-    try:
-        session = get_db_session()
-        result = session.query(EnergyPrice.timestamp).order_by(EnergyPrice.timestamp.desc()).first()
-        session.close()
+        # Group by date
+        df_copy = df.copy()
+        df_copy['date'] = df_copy.index.date
+        df_copy['hour'] = df_copy.index.hour + 1  # Convert to 1-24 hour format
         
-        return result[0] if result else None
+        daily_data = []
         
-    except Exception as e:
-        logging.error(f"Failed to get latest timestamp from TimescaleDB Tiger Cloud: {e}")
-        return None
-
-def get_price_stats() -> dict:
-    """Get comprehensive statistics about the price data in TimescaleDB Tiger Cloud."""
-    try:
-        session = get_db_session()
-        
-        from sqlalchemy import func
-        
-        stats_query = session.query(
-            func.count(EnergyPrice.timestamp).label('count'),
-            func.min(EnergyPrice.timestamp).label('min_timestamp'),
-            func.max(EnergyPrice.timestamp).label('max_timestamp'),
-            func.min(EnergyPrice.price).label('min_price'),
-            func.max(EnergyPrice.price).label('max_price'),
-            func.avg(EnergyPrice.price).label('avg_price')
-        ).first()
-        
-        if stats_query.count == 0:
-            session.close()
-            return {}
-        
-        std_result = session.execute(text("""
-            SELECT stddev(price) as price_std FROM energy_prices
-        """)).fetchone()
-        
-        session.close()
-        
-        stats = {
-            "total_records": int(stats_query.count),
-            "date_range": {
-                "start": stats_query.min_timestamp,
-                "end": stats_query.max_timestamp
-            },
-            "price_stats": {
-                "min": float(stats_query.min_price),
-                "max": float(stats_query.max_price),
-                "mean": float(stats_query.avg_price),
-                "std": float(std_result[0]) if std_result and std_result[0] else 0.0
-            }
-        }
-        
-        return stats
-        
-    except Exception as e:
-        logging.error(f"Failed to get price stats from TimescaleDB Tiger Cloud: {e}")
-        return {}
-
-def optimize_database():
-    """Optimize the TimescaleDB Tiger Cloud for better performance."""
-    try:
-        engine = get_engine()
-        
-        with engine.connect() as conn:
-            conn.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_energy_prices_timestamp 
-                ON energy_prices (timestamp DESC);
-            """))
+        for date, group in df_copy.groupby('date'):
+            row_data = {'delivery_day': date.strftime('%Y-%m-%d')}
             
-            conn.execute(text("ANALYZE energy_prices;"))
-            
-            conn.commit()
-        
-        logging.info("TimescaleDB Tiger Cloud optimization completed")
-        return True
-        
-    except Exception as e:
-        logging.error(f"Failed to optimize TimescaleDB Tiger Cloud: {e}")
-        return False
-
-def cleanup_old_data(days_to_keep: int = 365):
-    """
-    Clean up old data from TimescaleDB Tiger Cloud.
-    
-    Args:
-        days_to_keep: Number of days of data to keep
-    """
-    try:
-        cutoff_date = datetime.now() - timedelta(days=days_to_keep)
-        
-        session = get_db_session()
-        deleted_count = session.query(EnergyPrice).filter(
-            EnergyPrice.timestamp < cutoff_date
-        ).delete()
-        
-        session.commit()
-        session.close()
-        
-        logging.info(f"Cleaned up {deleted_count} old price records from TimescaleDB Tiger Cloud")
-        return deleted_count
-        
-    except Exception as e:
-        logging.error(f"Failed to cleanup old data from TimescaleDB Tiger Cloud: {e}")
-        return 0
-
-# Daily Spot Price Operations
-
-def insert_historical_prices_to_db(df: pd.DataFrame) -> bool:
-    """
-    Insert historical energy prices into TimescaleDB Tiger Cloud.
-    
-    Args:
-        df: DataFrame with historical energy price data
-        
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        session = get_db_session()
-        
-        records_inserted = 0
-        records_updated = 0
-        
-        for _, row in df.iterrows():
-            existing = session.query(HistoricalEnergyPrices).filter(
-                HistoricalEnergyPrices.delivery_day == str(row['delivery_day'])
-            ).first()
-            
-            if existing:
-                for column in df.columns:
-                    if column != 'id' and hasattr(existing, column):
-                        value = None if pd.isna(row[column]) else row[column]
-                        setattr(existing, column, value)
-                records_updated += 1
-            else:
-                record_data = {}
-                for column in df.columns:
-                    if column != 'id':
-                        value = None if pd.isna(row[column]) else row[column]
-                        record_data[column] = value
+            for _, record in group.iterrows():
+                hour = record['hour']
+                price = record['price']
                 
-                new_record = HistoricalEnergyPrices(**record_data)
-                session.add(new_record)
-                records_inserted += 1
+                if 1 <= hour <= 24:
+                    if hour == 3:
+                        # Handle DST - if we have multiple hour 3 entries, use 3a and 3b
+                        if f'hour_3a' not in row_data:
+                            row_data['hour_3a'] = price
+                        else:
+                            row_data['hour_3b'] = price
+                    else:
+                        row_data[f'hour_{hour}'] = price
+            
+            daily_data.append(row_data)
         
-        session.commit()
-        session.close()
-        
-        logging.info(f"Historical prices: inserted {records_inserted}, updated {records_updated} records")
-        return True
+        return pd.DataFrame(daily_data)
         
     except Exception as e:
-        logging.error(f"Failed to insert historical prices to TimescaleDB Tiger Cloud: {e}")
-        if session:
-            session.rollback()
-            session.close()
-        return False
+        logging.error(f"Failed to convert time-series to daily format: {e}")
+        return pd.DataFrame()
 
 def load_historical_prices_from_db(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    limit: Optional[int] = None
+    limit: int = 30
 ) -> pd.DataFrame:
-    """
-    Load historical energy prices from TimescaleDB Tiger Cloud.
-    
-    Args:
-        start_date: Start date (YYYY-MM-DD format, optional)
-        end_date: End date (YYYY-MM-DD format, optional) 
-        limit: Maximum number of records (optional)
-    
-    Returns:
-        DataFrame with historical energy price data
-    """
+    """Load historical energy prices from TimescaleDB"""
     try:
         session = get_db_session()
         
         query = session.query(HistoricalEnergyPrices)
-        
+        logging.info(f"Loading historical energy prices from TimescaleDB from {start_date} to {end_date} with limit {limit}")
         if start_date:
             query = query.filter(HistoricalEnergyPrices.delivery_day >= start_date)
         if end_date:
@@ -389,153 +229,311 @@ def load_historical_prices_from_db(
         if limit:
             query = query.limit(limit)
         
-        results = query.all()
+        result = query.all()
         session.close()
         
-        if not results:
-            logging.warning("No historical price data found in TimescaleDB Tiger Cloud")
+        if not result:
+            logging.info("No historical energy price data found in TimescaleDB")
             return pd.DataFrame()
         
         data = []
-        for record in results:
-            row = {}
-            for column in HistoricalEnergyPrices.__table__.columns:
-                row[column.name] = getattr(record, column.name)
-            data.append(row)
+        for record in result:
+            row_data = {
+                'delivery_day': pd.to_datetime(record.delivery_day)
+            }
+            
+            for hour in range(1, 25):
+                if hour == 3:
+                    if hasattr(record, 'hour_3a') and record.hour_3a is not None:
+                        row_data['hour_3a'] = record.hour_3a
+                    if hasattr(record, 'hour_3b') and record.hour_3b is not None:
+                        row_data['hour_3b'] = record.hour_3b
+                else:
+                    hour_attr = f'hour_{hour}'
+                    if hasattr(record, hour_attr):
+                        value = getattr(record, hour_attr)
+                        if value is not None:
+                            row_data[hour_attr] = value
+            
+            data.append(row_data)
         
         df = pd.DataFrame(data)
-        df['delivery_day'] = pd.to_datetime(df['delivery_day'])
         
-        logging.info(f"Loaded {len(df)} historical price records from TimescaleDB Tiger Cloud")
+        if not df.empty:
+            date_range = f"from {df['delivery_day'].min().strftime('%Y-%m-%d')} to {df['delivery_day'].max().strftime('%Y-%m-%d')}"
+            logging.info(f"Loaded {len(df)} historical energy price records from TimescaleDB {date_range}")
+        else:
+            logging.info("No historical energy price records found in TimescaleDB")
         return df
         
     except Exception as e:
-        logging.error(f"Failed to load historical prices from TimescaleDB Tiger Cloud: {e}")
+        logging.error(f"Failed to load historical prices from TimescaleDB: {e}")
         return pd.DataFrame()
 
-def convert_historical_to_hourly(delivery_day: str) -> pd.DataFrame:
-    """
-    Convert a single historical record to hourly time-series format.
-    
-    Args:
-        delivery_day: Date in YYYY-MM-DD format
+def insert_historical_prices_to_db(df: pd.DataFrame) -> bool:
+    """Insert historical energy price data into TimescaleDB"""
+    try:
+        if df.empty:
+            logging.warning("Empty DataFrame provided for historical price insertion")
+            return True
         
-    Returns:
-        DataFrame with hourly time-series data
-    """
+        init_database()
+        
+        session = get_db_session()
+        
+        for _, row in df.iterrows():
+            delivery_day = row['delivery_day']
+            
+            existing = session.query(HistoricalEnergyPrices).filter(
+                HistoricalEnergyPrices.delivery_day == delivery_day
+            ).first()
+            
+            if existing:
+                logging.debug(f"Skipping existing delivery_day: {delivery_day}")
+                continue
+            
+            record_data = {'delivery_day': delivery_day}
+            
+            for hour in range(1, 25):
+                if hour == 3:
+                    if 'hour_3a' in row and pd.notna(row['hour_3a']):
+                        record_data['hour_3a'] = float(row['hour_3a'])
+                    if 'hour_3b' in row and pd.notna(row['hour_3b']):
+                        record_data['hour_3b'] = float(row['hour_3b'])
+                else:
+                    hour_col = f'hour_{hour}'
+                    if hour_col in row and pd.notna(row[hour_col]):
+                        record_data[hour_col] = float(row[hour_col])
+            
+            new_record = HistoricalEnergyPrices(**record_data)
+            session.add(new_record)
+        
+        session.commit()
+        session.close()
+        
+        logging.info(f"Successfully inserted historical energy price data")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Failed to insert historical prices: {e}")
+        if 'session' in locals():
+            session.rollback()
+            session.close()
+        return False
+
+def get_price_count() -> int:
+    """Get total count of hourly price records from historical_energy_prices"""
     try:
         session = get_db_session()
         
-        record = session.query(HistoricalEnergyPrices).filter(
-            HistoricalEnergyPrices.delivery_day == delivery_day
-        ).first()
-        
+        # Count all hourly records from historical data
+        result = session.query(HistoricalEnergyPrices).all()
         session.close()
         
-        if not record:
-            return pd.DataFrame()
+        total_hours = 0
+        for record in result:
+            for hour in range(1, 25):
+                if hour == 3:
+                    if hasattr(record, 'hour_3a') and getattr(record, 'hour_3a') is not None:
+                        total_hours += 1
+                    if hasattr(record, 'hour_3b') and getattr(record, 'hour_3b') is not None:
+                        total_hours += 1
+                else:
+                    hour_attr = f'hour_{hour}'
+                    if hasattr(record, hour_attr) and getattr(record, hour_attr) is not None:
+                        total_hours += 1
         
-        return record.to_hourly_series()
-        
+        return total_hours
     except Exception as e:
-        logging.error(f"Failed to convert historical to hourly data: {e}")
-        return pd.DataFrame()
+        logging.error(f"Error getting price count: {e}")
+        return 0
 
 def get_historical_price_count() -> int:
-    """Get total number of historical price records."""
+    """Get total count of historical energy price records"""
     try:
         session = get_db_session()
         count = session.query(HistoricalEnergyPrices).count()
         session.close()
         return count
-        
     except Exception as e:
-        logging.error(f"Failed to get historical price count: {e}")
+        logging.error(f"Error getting historical price count: {e}")
         return 0
 
-def get_historical_price_stats() -> dict:
-    """Get comprehensive statistics about historical price data."""
+def get_latest_timestamp() -> Optional[datetime]:
+    """Get the latest timestamp from historical_energy_prices table"""
+    try:
+        session = get_db_session()
+        result = session.query(HistoricalEnergyPrices.delivery_day).order_by(
+            HistoricalEnergyPrices.delivery_day.desc()
+        ).first()
+        session.close()
+        
+        if result:
+            # Convert delivery_day to datetime and add 23 hours to get end of day
+            latest_date = pd.to_datetime(result[0])
+            latest_timestamp = latest_date + pd.Timedelta(hours=23)
+            return latest_timestamp.to_pydatetime()
+        
+        return None
+    except Exception as e:
+        logging.error(f"Error getting latest timestamp: {e}")
+        return None
+
+def get_price_stats():
+    """Get basic statistics for energy prices from historical data"""
+    try:
+        # Use the historical price stats function as it provides the same information
+        return get_historical_price_stats()
+        
+    except Exception as e:
+        logging.error(f"Error getting price statistics: {e}")
+        return None
+
+def get_historical_price_stats():
+    """Get basic statistics for historical energy prices"""
     try:
         session = get_db_session()
         
-        from sqlalchemy import func
-        
-        stats_query = session.query(
-            func.count(HistoricalEnergyPrices.id).label('count'),
-            func.min(HistoricalEnergyPrices.delivery_day).label('min_date'),
-            func.max(HistoricalEnergyPrices.delivery_day).label('max_date')
-        ).first()
-        
+        result = session.query(HistoricalEnergyPrices).all()
         session.close()
         
-        if stats_query.count == 0:
-            return {}
+        if not result:
+            return None
+        
+        dates = [pd.to_datetime(r.delivery_day) for r in result]
+        all_prices = []
+        
+        for record in result:
+            for hour in range(1, 25):
+                if hour == 3:
+                    if hasattr(record, 'hour_3a') and record.hour_3a is not None:
+                        all_prices.append(float(record.hour_3a))
+                    if hasattr(record, 'hour_3b') and record.hour_3b is not None:
+                        all_prices.append(float(record.hour_3b))
+                else:
+                    hour_attr = f'hour_{hour}'
+                    if hasattr(record, hour_attr):
+                        value = getattr(record, hour_attr)
+                        if value is not None:
+                            all_prices.append(float(value))
+        
+        if not all_prices:
+            return {
+                'count': len(result),
+                'date_range': {
+                    'start': min(dates).strftime('%Y-%m-%d') if dates else None,
+                    'end': max(dates).strftime('%Y-%m-%d') if dates else None
+                }
+            }
+        
+        import numpy as np
         
         stats = {
-            "total_records": int(stats_query.count),
-            "date_range": {
-                "start": stats_query.min_date,
-                "end": stats_query.max_date
+            'count': len(result),
+            'date_range': {
+                'start': min(dates).strftime('%Y-%m-%d'),
+                'end': max(dates).strftime('%Y-%m-%d')
+            },
+            'price_stats': {
+                'min': float(np.min(all_prices)),
+                'max': float(np.max(all_prices)),
+                'mean': float(np.mean(all_prices)),
+                'std': float(np.std(all_prices))
             }
         }
         
         return stats
         
     except Exception as e:
-        logging.error(f"Failed to get historical price stats: {e}")
-        return {}
+        logging.error(f"Error getting historical price statistics: {e}")
+        return None
 
-def get_peak_hours_analysis(days: int = 30) -> dict:
-    """
-    Analyze peak hours patterns from recent historical data.
-    
-    Args:
-        days: Number of recent days to analyze
-        
-    Returns:
-        Dictionary with peak hours analysis
-    """
+def get_peak_hours_analysis(days: int = 30):
+    """Analyze peak hours patterns from recent historical data"""
     try:
         session = get_db_session()
         
-        records = session.query(HistoricalEnergyPrices).order_by(
+        query = session.query(HistoricalEnergyPrices).order_by(
             HistoricalEnergyPrices.delivery_day.desc()
-        ).limit(days).all()
+        ).limit(days)
         
+        result = query.all()
         session.close()
         
-        if not records:
-            return {}
+        if not result:
+            return None
+        
+        hourly_data = {}
+        for hour in range(1, 25):
+            hourly_data[hour] = []
+        
+        hourly_data[3] = []
+        
+        peak_count_by_hour = {}
+        for hour in range(1, 25):
+            peak_count_by_hour[hour] = 0
+        peak_count_by_hour[3] = 0
+        
+        for record in result:
+            daily_prices = []
+            
+            for hour in range(1, 25):
+                if hour == 3:
+                    if hasattr(record, 'hour_3a') and record.hour_3a is not None:
+                        hourly_data[3].append(float(record.hour_3a))
+                        daily_prices.append((3, float(record.hour_3a)))
+                    if hasattr(record, 'hour_3b') and record.hour_3b is not None:
+                        daily_prices.append((3, float(record.hour_3b)))
+                else:
+                    hour_attr = f'hour_{hour}'
+                    if hasattr(record, hour_attr):
+                        value = getattr(record, hour_attr)
+                        if value is not None:
+                            hourly_data[hour].append(float(value))
+                            daily_prices.append((hour, float(value)))
+            
+            if daily_prices:
+                max_price = max(daily_prices, key=lambda x: x[1])
+                peak_hour = max_price[0]
+                peak_count_by_hour[peak_hour] += 1
         
         hourly_averages = {}
-        hourly_peaks = {}
-        
         for hour in range(1, 25):
-            hour_col = f'hour_{hour}' if hour != 3 else 'hour_3a'
-            prices = []
-            peak_count = 0
-            
-            for record in records:
-                price = getattr(record, hour_col, None)
-                if price is not None:
-                    prices.append(price)
-                    if hour in record.get_peak_hours():
-                        peak_count += 1
-            
-            if prices:
-                hourly_averages[f'hour_{hour}'] = sum(prices) / len(prices)
-                hourly_peaks[f'hour_{hour}'] = peak_count / len(records) * 100
+            if hourly_data[hour]:
+                hourly_averages[f"hour_{hour}"] = round(
+                    sum(hourly_data[hour]) / len(hourly_data[hour]), 2
+                )
+        
+        total_days_analyzed = len(result)
+        peak_frequency_percent = {}
+        for hour in range(1, 25):
+            if peak_count_by_hour[hour] > 0:
+                peak_frequency_percent[f"hour_{hour}"] = round(
+                    (peak_count_by_hour[hour] / total_days_analyzed) * 100, 1
+                )
+        
+        sorted_by_frequency = sorted(
+            peak_frequency_percent.items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        
+        sorted_by_price = sorted(
+            hourly_averages.items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
         
         return {
-            "days_analyzed": len(records),
-            "hourly_averages": hourly_averages,
-            "peak_frequency_percent": hourly_peaks,
-            "most_expensive_hours": sorted(hourly_averages.items(), key=lambda x: x[1], reverse=True)[:5],
-            "cheapest_hours": sorted(hourly_averages.items(), key=lambda x: x[1])[:5]
+            'days_analyzed': total_days_analyzed,
+            'hourly_averages': hourly_averages,
+            'peak_frequency_percent': peak_frequency_percent,
+            'most_expensive_hours': [item[0] for item in sorted_by_price[:5]],
+            'cheapest_hours': [item[0] for item in sorted_by_price[-5:]]
         }
         
     except Exception as e:
-        logging.error(f"Failed to analyze peak hours: {e}")
-        return {}
+        logging.error(f"Error analyzing peak hours: {e}")
+        return None
 
 logging.basicConfig(level=logging.INFO)
